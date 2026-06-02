@@ -2,6 +2,7 @@ import asyncio
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse
 from faster_whisper import WhisperModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from threading import Thread
@@ -14,7 +15,7 @@ app = FastAPI()
 # =====================================================================
 # 🛑 PASTE YOUR HUGGING FACE TOKEN HERE
 # =====================================================================
-HF_TOKEN = "token"
+HF_TOKEN = "hf_your_actual_token_here"
 
 print("Loading Models into VRAM. This will take a moment...")
 
@@ -33,7 +34,7 @@ llm_model = AutoModelForCausalLM.from_pretrained(
     token=HF_TOKEN
 )
 
-# 3. Load Kokoro TTS Pipeline ('a' stands for American English)
+# 3. Load Kokoro TTS Pipeline
 tts_pipeline = KPipeline(lang_code='a')
 
 print("Models loaded successfully!")
@@ -42,15 +43,8 @@ print("Models loaded successfully!")
 # KOKORO AUDIO SYNTHESIS
 # =====================================================================
 def synthesize_audio(text: str) -> bytes:
-    """
-    Takes a string of text, generates speech using Kokoro, 
-    and returns raw 16-bit PCM audio bytes for the WebSocket.
-    """
     print(f"[TTS Generating]: {text}")
-    
-    # 'af_heart' is a highly natural-sounding female American voice
     generator = tts_pipeline(text, voice='af_heart', speed=1.0)
-    
     all_audio = []
     for _, _, audio_numpy in generator:
         all_audio.append(audio_numpy)
@@ -58,20 +52,149 @@ def synthesize_audio(text: str) -> bytes:
     if not all_audio:
         return b""
         
-    # Combine chunks (if any)
     combined_audio = np.concatenate(all_audio)
-    
-    # Kokoro outputs float32 audio natively. 
-    # Convert it to standard 16-bit PCM for WebSocket transmission.
+    # Convert float32 native output to 16-bit PCM for the client browser
     audio_int16 = (combined_audio * 32767).astype(np.int16)
-    
     return audio_int16.tobytes()
 
 # =====================================================================
-# WEBSOCKET LOGIC
+# EMBEDDED FRONTEND INTERFACE (HTML/JS)
 # =====================================================================
-system_prompt = "You are a friendly internal IT Helpdesk assistant. Keep answers brief and conversational."
-chat_history = [{"role": "system", "content": system_prompt}]
+@app.get("/")
+async def get_frontend():
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>AI Voice Agent Test Portal</title>
+        <style>
+            body { font-family: sans-serif; background: #121212; color: #e0e0e0; max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }
+            button { font-size: 18px; padding: 15px 30px; border: none; border-radius: 25px; cursor: pointer; font-weight: bold; margin: 20px; transition: 0.2s; }
+            .start { background: #4CAF50; color: white; }
+            .stop { background: #f44336; color: white; }
+            #status { font-style: italic; color: #888; margin-top: 10px; }
+            #log { background: #1e1e1e; padding: 15px; border-radius: 8px; text-align: left; height: 200px; overflow-y: auto; font-family: monospace; }
+        </style>
+    </head>
+    <body>
+        <h2>Voice Agent Tester</h2>
+        <p>Talk to your IT Helpdesk Assistant</p>
+        <button id="actionBtn" class="start">Start Conversation</button>
+        <div id="status">Disconnected</div>
+        <h3>Console Output</h3>
+        <div id="log"></div>
+
+        <script>
+            let ws;
+            let audioContext;
+            let processor;
+            let globalStream;
+            const actionBtn = document.getElementById('actionBtn');
+            const statusDiv = document.getElementById('status');
+            const logDiv = document.getElementById('log');
+
+            function log(msg) {
+                logDiv.innerHTML += `<div>${msg}</div>`;
+                logDiv.scrollTop = logDiv.scrollHeight;
+            }
+
+            actionBtn.onclick = async () => {
+                if (actionBtn.classList.contains('start')) {
+                    actionBtn.textContent = 'Stop Conversation';
+                    actionBtn.className = 'stop';
+                    statusDiv.textContent = 'Connecting...';
+                    initWebSocket();
+                } else {
+                    stopAudio();
+                }
+            };
+
+            function initWebSocket() {
+                const wsProto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+                const wsUrl = `${wsProto}${window.location.host}/ws/voice`;
+                
+                ws = new WebSocket(wsUrl);
+                ws.binaryType = 'arraybuffer';
+
+                ws.onopen = () => {
+                    statusDiv.textContent = 'Connected & Listening';
+                    log("Connected to AI Backend Server.");
+                    startAudioRecording();
+                };
+
+                ws.onmessage = async (event) => {
+                    log("Received audio response chunk from AI...");
+                    playAudioPCM(event.data);
+                };
+
+                ws.onclose = () => { stopAudio(); };
+                ws.onerror = (err) => { log(`WebSocket Error: ${err}`); stopAudio(); };
+            }
+
+            async function startAudioRecording() {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                globalStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const source = audioContext.createMediaStreamSource(globalStream);
+                
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = (e) => {
+                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                    
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const pcmBuffer = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        let s = Math.max(-1, Math.min(1, inputData[i]));
+                        pcmBuffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+                    ws.send(pcmBuffer.buffer);
+                };
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+            }
+
+            function playAudioPCM(arrayBuffer) {
+                const ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+                const int16Array = new Int16Array(arrayBuffer);
+                const float32Array = new Float32Array(int16Array.length);
+                
+                for (let i = 0; i < int16Array.length; i++) {
+                    float32Array[i] = int16Array[i] / 32768.0;
+                }
+                
+                const buffer = ttsCtx.createBuffer(1, float32Array.length, 24000);
+                buffer.getChannelData(0).set(float32Array);
+                
+                const source = ttsCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(ttsCtx.destination);
+                source.start();
+            }
+
+            function stopAudio() {
+                actionBtn.textContent = 'Start Conversation';
+                actionBtn.className = 'start';
+                statusDiv.textContent = 'Disconnected';
+                
+                if (processor) { processor.disconnect(); processor = null; }
+                if (globalStream) { globalStream.getTracks().forEach(t => t.stop()); globalStream = null; }
+                if (audioContext) { audioContext.close(); audioContext = null; }
+                if (ws) { ws.close(); ws = null; }
+                log("Session stopped.");
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content, status_code=200)
+
+# =====================================================================
+# WEBSOCKET STREAMING LOGIC
+# =====================================================================
+# We define the system prompt here and inject it into the first user message.
+system_prompt = "System Instructions: You are a friendly internal IT Helpdesk assistant. Keep answers brief and conversational.\n\n"
+chat_history = [] 
 
 @app.websocket("/ws/voice")
 async def voice_agent_endpoint(websocket: WebSocket):
@@ -81,14 +204,17 @@ async def voice_agent_endpoint(websocket: WebSocket):
     
     try:
         while True:
-            # Receive Audio Stream from Client
             message = await websocket.receive_bytes()
             audio_buffer.extend(message)
             
-            # Process roughly 1 second of audio at a time (assuming 16kHz, 16-bit mono input)
+            # Process roughly 1 second of audio at a time
             if len(audio_buffer) > 16000 * 2:  
-                audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
-                audio_buffer.clear()
+                # Fix for network fragmentation (ensure even bytes)
+                valid_length = (len(audio_buffer) // 2) * 2
+                bytes_to_process = audio_buffer[:valid_length]
+                audio_buffer = bytearray(audio_buffer[valid_length:])
+                
+                audio_np = np.frombuffer(bytes_to_process, dtype=np.int16).astype(np.float32) / 32768.0
                 
                 # --- ASR STAGE ---
                 segments, _ = asr_model.transcribe(audio_np, beam_size=1)
@@ -96,7 +222,12 @@ async def voice_agent_endpoint(websocket: WebSocket):
                 
                 if user_text:
                     print(f"\nUser said: {user_text}")
-                    chat_history.append({"role": "user", "content": user_text})
+                    
+                    # Inject the system prompt ONLY on the very first turn
+                    if len(chat_history) == 0:
+                        chat_history.append({"role": "user", "content": system_prompt + user_text})
+                    else:
+                        chat_history.append({"role": "user", "content": user_text})
                     
                     # --- LLM STAGE ---
                     inputs = tokenizer.apply_chat_template(
@@ -119,18 +250,18 @@ async def voice_agent_endpoint(websocket: WebSocket):
                         sentence_buffer += new_token
                         assistant_full_reply += new_token
                         
-                        # Trigger TTS when a full sentence is formed
                         if any(punct in sentence_buffer for punct in [".", "?", "!"]):
-                            # Generate and send audio immediately
                             audio_chunk = synthesize_audio(sentence_buffer.strip())
-                            await websocket.send_bytes(audio_chunk)
+                            if audio_chunk:
+                                await websocket.send_bytes(audio_chunk)
                             sentence_buffer = "" 
                     
-                    chat_history.append({"role": "assistant", "content": assistant_full_reply})
+                    chat_history.append({"role": "model", "content": assistant_full_reply})
                     print(f"Assistant replied: {assistant_full_reply}")
                     
     except Exception as e:
         print(f"WebSocket connection closed: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Running on 6006 to allow JarvisLabs web dashboard port forwarding
+    uvicorn.run(app, host="0.0.0.0", port=6006)
