@@ -21,7 +21,7 @@ To ensure a natural conversation, components overlap. The TTS begins generating 
 3. Quantized the LLM to `fp16` to increase token generation speed.
 
 ## Live Demo & Audio Samples
-* **Web App:** [[Insert your JarvisLabs exposed URL here]](https://4f5dba4203781.notebooksn.jarvislabs.net/)
+* **Web App:** Insert your JarvisLabs exposed URL here]](https://4f5dba4203781.notebooksn.jarvislabs.net/
 
 **Sample Fallback Transcript:**
 > **User (Audio):** "Hey, I'm locked out of my work email, can you help?"
