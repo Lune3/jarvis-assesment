@@ -6,19 +6,22 @@ from faster_whisper import WhisperModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from threading import Thread
 
+# Import Kokoro TTS
+from kokoro import KPipeline
+
 app = FastAPI()
 
-# --- PUT YOUR HUGGING FACE TOKEN HERE ---
-HF_TOKEN = "hf_your_actual_token_here"
-# ----------------------------------------
+# =====================================================================
+# 🛑 PASTE YOUR HUGGING FACE TOKEN HERE
+# =====================================================================
+HF_TOKEN = "token"
 
-# 1. Initialize Models (Load into VRAM once at startup)
-print("Loading Models into VRAM...")
+print("Loading Models into VRAM. This will take a moment...")
 
-# Load ASR
+# 1. Load ASR (Speech-to-Text)
 asr_model = WhisperModel("base.en", device="cuda", compute_type="float16")
 
-# Load LLM (Replace Qwen with Gemma and use the token)
+# 2. Load LLM (Reasoning)
 tokenizer = AutoTokenizer.from_pretrained(
     "google/gemma-2b-it", 
     token=HF_TOKEN
@@ -30,25 +33,43 @@ llm_model = AutoModelForCausalLM.from_pretrained(
     token=HF_TOKEN
 )
 
-# 1. Initialize Models (Load into VRAM once at startup)
-print("Loading Models into VRAM...")
-asr_model = WhisperModel("base.en", device="cuda", compute_type="float16")
+# 3. Load Kokoro TTS Pipeline ('a' stands for American English)
+tts_pipeline = KPipeline(lang_code='a')
 
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
-llm_model = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen2.5-7B-Instruct", 
-    torch_dtype="auto", 
-    device_map="cuda"
-)
+print("Models loaded successfully!")
 
-def synthesize_audio(text):
+# =====================================================================
+# KOKORO AUDIO SYNTHESIS
+# =====================================================================
+def synthesize_audio(text: str) -> bytes:
     """
-    Plug in your open TTS engine here (e.g., Voxtral, Kokoro, MeloTTS).
-    Should accept text and return raw PCM audio bytes.
+    Takes a string of text, generates speech using Kokoro, 
+    and returns raw 16-bit PCM audio bytes for the WebSocket.
     """
-    # ... TTS inference logic ...
-    return b"simulated_audio_bytes"
+    print(f"[TTS Generating]: {text}")
+    
+    # 'af_heart' is a highly natural-sounding female American voice
+    generator = tts_pipeline(text, voice='af_heart', speed=1.0)
+    
+    all_audio = []
+    for _, _, audio_numpy in generator:
+        all_audio.append(audio_numpy)
+        
+    if not all_audio:
+        return b""
+        
+    # Combine chunks (if any)
+    combined_audio = np.concatenate(all_audio)
+    
+    # Kokoro outputs float32 audio natively. 
+    # Convert it to standard 16-bit PCM for WebSocket transmission.
+    audio_int16 = (combined_audio * 32767).astype(np.int16)
+    
+    return audio_int16.tobytes()
 
+# =====================================================================
+# WEBSOCKET LOGIC
+# =====================================================================
 system_prompt = "You are a friendly internal IT Helpdesk assistant. Keep answers brief and conversational."
 chat_history = [{"role": "system", "content": system_prompt}]
 
@@ -56,56 +77,60 @@ chat_history = [{"role": "system", "content": system_prompt}]
 async def voice_agent_endpoint(websocket: WebSocket):
     await websocket.accept()
     audio_buffer = bytearray()
+    print("Client connected via WebSocket.")
     
     try:
         while True:
-            # 1. Receive Audio Stream from Client
+            # Receive Audio Stream from Client
             message = await websocket.receive_bytes()
             audio_buffer.extend(message)
             
-            # 2. VAD & Chunking (Process roughly 1 second of audio at a time)
-            if len(audio_buffer) > 16000 * 2:  # Assuming 16kHz, 16-bit
+            # Process roughly 1 second of audio at a time (assuming 16kHz, 16-bit mono input)
+            if len(audio_buffer) > 16000 * 2:  
                 audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
                 audio_buffer.clear()
                 
-                # ASR Stage
+                # --- ASR STAGE ---
                 segments, _ = asr_model.transcribe(audio_np, beam_size=1)
                 user_text = "".join([segment.text for segment in segments]).strip()
                 
                 if user_text:
-                    print(f"User: {user_text}")
+                    print(f"\nUser said: {user_text}")
                     chat_history.append({"role": "user", "content": user_text})
                     
-                    # LLM Stage - Streaming setup
-                    inputs = tokenizer.apply_chat_template(chat_history, return_tensors="pt", add_generation_prompt=True).to("cuda")
+                    # --- LLM STAGE ---
+                    inputs = tokenizer.apply_chat_template(
+                        chat_history, 
+                        return_tensors="pt", 
+                        add_generation_prompt=True
+                    ).to("cuda")
+                    
                     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
                     generation_kwargs = dict(input_ids=inputs, streamer=streamer, max_new_tokens=150)
                     
-                    # Run LLM generation in a separate thread so we can yield tokens
                     thread = Thread(target=llm_model.generate, kwargs=generation_kwargs)
                     thread.start()
                     
                     sentence_buffer = ""
                     assistant_full_reply = ""
                     
-                    # TTS Stage - Sentence Boundary Detection
+                    # --- TTS & STREAMING STAGE ---
                     for new_token in streamer:
                         sentence_buffer += new_token
                         assistant_full_reply += new_token
                         
-                        # Trigger TTS when a sentence is complete
+                        # Trigger TTS when a full sentence is formed
                         if any(punct in sentence_buffer for punct in [".", "?", "!"]):
+                            # Generate and send audio immediately
                             audio_chunk = synthesize_audio(sentence_buffer.strip())
-                            
-                            # Stream audio back to client immediately
                             await websocket.send_bytes(audio_chunk)
                             sentence_buffer = "" 
                     
-                    # Append the final full reply to memory
                     chat_history.append({"role": "assistant", "content": assistant_full_reply})
+                    print(f"Assistant replied: {assistant_full_reply}")
                     
     except Exception as e:
-        print(f"Connection closed: {e}")
+        print(f"WebSocket connection closed: {e}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
